@@ -5,7 +5,7 @@ const multer = require('multer');
 const { Pool } = require('pg');
 const xlsx = require('xlsx');
 const fs = require('fs');
-const qrcode = require('qrcode'); // <--- Nova biblioteca
+const qrcode = require('qrcode');
 const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
@@ -13,19 +13,22 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Agora aceitamos dois campos de ficheiro: 'file' (contactos) e 'image' (imagem da campanha)
 const upload = multer({ dest: 'uploads/' });
+const uploadFields = upload.fields([{ name: 'file', maxCount: 1 }, { name: 'image', maxCount: 1 }]);
+
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 let sock;
-let currentQR = '';      // Guarda o QR Code atual
-let isConnected = false; // Estado da conexão
+let currentQR = '';      
+let isConnected = false; 
 
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
     
     sock = makeWASocket({
         auth: state,
-        printQRInTerminal: false, // <-- Desligamos o terminal, agora vai para o APP
+        printQRInTerminal: false, 
         logger: pino({ level: 'silent' })
     });
 
@@ -34,7 +37,6 @@ async function connectToWhatsApp() {
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // Se recebermos um QR Code novo, geramos a imagem
         if (qr) {
             currentQR = await qrcode.toDataURL(qr);
             isConnected = false;
@@ -44,12 +46,9 @@ async function connectToWhatsApp() {
             isConnected = false;
             currentQR = '';
             const statusCode = lastDisconnect.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-            
-            if (shouldReconnect) {
+            if (statusCode !== DisconnectReason.loggedOut) {
                 connectToWhatsApp();
             } else {
-                // Se foi desconectado pelo telemóvel, apaga os dados antigos e tenta novo QR Code
                 fs.rmSync('auth_info_baileys', { recursive: true, force: true });
                 connectToWhatsApp();
             }
@@ -74,14 +73,10 @@ async function connectToWhatsApp() {
 }
 connectToWhatsApp();
 
-// ----------------------------------------------------
-// NOVA ROTA: Retorna o status da conexão e o QR Code
-// ----------------------------------------------------
 app.get('/api/status', (req, res) => {
     res.json({ isConnected, qr: currentQR });
 });
 
-// Tratamento focado em Moçambique (Mantido)
 function extractNumbers(text, file) {
     let numbers = new Set();
     const processNumber = (n) => {
@@ -98,33 +93,55 @@ function extractNumbers(text, file) {
             const sheet = workbook.Sheets[workbook.SheetNames[0]];
             const data = xlsx.utils.sheet_to_json(sheet, { header: 1 });
             data.forEach(row => { if (row[0]) processNumber(row[0]); });
-            fs.unlinkSync(file.path);
+            fs.unlinkSync(file.path); // Apaga ficheiro excel após extrair
         } catch (error) { console.error(error); }
     }
     return Array.from(numbers);
 }
 
-// Rota de Envio em Massa (Mantido)
-app.post('/api/send', upload.single('file'), async (req, res) => {
+// ROTA DE ENVIO ATUALIZADA (Lida com imagem)
+app.post('/api/send', uploadFields, async (req, res) => {
     try {
         if (!isConnected) return res.status(400).json({ error: 'WhatsApp não está conectado!' });
 
         const { message, manualNumbers } = req.body;
-        const numbers = extractNumbers(manualNumbers, req.file);
+        
+        // Pega os ficheiros carregados
+        const contactsFile = req.files['file'] ? req.files['file'][0] : null;
+        const imageFile = req.files['image'] ? req.files['image'][0] : null;
 
-        if (numbers.length === 0 || !message) return res.status(400).json({ error: 'Mensagem inválida ou nenhum número válido detectado.' });
+        const numbers = extractNumbers(manualNumbers, contactsFile);
+
+        if (numbers.length === 0 || !message) {
+            return res.status(400).json({ error: 'Mensagem inválida ou nenhum número válido detectado.' });
+        }
+
+        // Se o utilizador enviou uma imagem, nós lemos a imagem para a memória
+        let imageBuffer = null;
+        if (imageFile) {
+            imageBuffer = fs.readFileSync(imageFile.path);
+            fs.unlinkSync(imageFile.path); // Apaga a imagem do servidor após ler para não encher o disco
+        }
 
         const campRes = await pool.query('INSERT INTO campaigns (message) VALUES ($1) RETURNING id', [message]);
         const campaignId = campRes.rows[0].id;
 
         res.json({ success: true, message: `${numbers.length} mensagens enviadas para a fila!`, campaignId });
 
+        // Loop de envio
         for (const number of numbers) {
             const jid = `${number}@s.whatsapp.net`;
             try {
                 const [exists] = await sock.onWhatsApp(jid);
                 if (exists) {
-                    const sentMsg = await sock.sendMessage(jid, { text: message });
+                    
+                    // Se tem imagem, manda a imagem e põe o texto como legenda. Se não, manda só texto.
+                    const msgOptions = imageBuffer 
+                        ? { image: imageBuffer, caption: message } 
+                        : { text: message };
+
+                    const sentMsg = await sock.sendMessage(jid, msgOptions);
+                    
                     await pool.query('INSERT INTO messages (campaign_id, phone, status, wa_message_id) VALUES ($1, $2, $3, $4)', [campaignId, number, 'sent', sentMsg.key.id]);
                 } else {
                     await pool.query('INSERT INTO messages (campaign_id, phone, status) VALUES ($1, $2, $3)', [campaignId, number, 'failed (não tem WA)']);
@@ -132,6 +149,7 @@ app.post('/api/send', upload.single('file'), async (req, res) => {
             } catch (error) {
                 await pool.query('INSERT INTO messages (campaign_id, phone, status) VALUES ($1, $2, $3)', [campaignId, number, 'failed']);
             }
+            // Delay anti-ban
             await new Promise(r => setTimeout(r, Math.random() * 3000 + 3000));
         }
     } catch (err) {
@@ -140,7 +158,6 @@ app.post('/api/send', upload.single('file'), async (req, res) => {
     }
 });
 
-// Rota de Histórico (Mantido)
 app.get('/api/history', async (req, res) => {
     const result = await pool.query(`
         SELECT c.id, c.message, c.created_at, COUNT(m.id) as total,
