@@ -1,0 +1,23 @@
+{
+  "name": "whatsapp-massa-moz",
+  "version": "1.0.0",
+  "description": "API para envio em massa no WhatsApp (Moçambique)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.11.5",
+    "pino": "^9.0.0",
+    "qrcode-terminal": "^0.12.0",
+    "xlsx": "^0.18.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
