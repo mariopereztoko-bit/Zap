@@ -16,6 +16,7 @@ app.use(express.json());
 const upload = multer({ dest: 'uploads/' });
 const uploadFields = upload.fields([{ name: 'file', maxCount: 1 }, { name: 'image', maxCount: 3 }]);
 
+// Ligação à base de dados Neon
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 let sock;
@@ -56,29 +57,41 @@ app.get('/api/auth/check', async (req, res) => {
 });
 
 // ==========================================
-// 2. SESSÃO DO WHATSAPP SEGURA (POSTGRES)
+// 2. SESSÃO DO WHATSAPP SEGURA (POSTGRES + CACHE HÍBRIDA)
 // ==========================================
 async function usePostgresAuthState(pool) {
+    // CACHE NA MEMÓRIA: Impede que o Neon limite as conexões e o WhatsApp desconecte
+    const localCache = {};
+
     const writeData = async (data, id) => {
         try {
+            localCache[id] = data; // Grava logo na RAM para o Baileys não esperar
             const str = JSON.stringify(data, BufferJSON.replacer);
-            // Requer que "id" seja PRIMARY KEY na tabela
+            // Grava no banco sem pressa e previne duplicações
             await pool.query(`INSERT INTO wa_sessions (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data`, [id, str]);
         } catch (e) {
-            console.log(`⚠️ Erro ao salvar sessão (${id}):`, e.message);
+            console.log(`⚠️ Erro DB Write (${id}):`, e.message);
         }
     };
+
     const readData = async (id) => {
         try {
+            if (localCache[id]) return localCache[id]; // Se estiver na memória, pega na hora!
             const res = await pool.query('SELECT data FROM wa_sessions WHERE id = $1', [id]);
-            if (res.rows.length > 0) return JSON.parse(res.rows[0].data, BufferJSON.reviver);
+            if (res.rows.length > 0) {
+                const parsed = JSON.parse(res.rows[0].data, BufferJSON.reviver);
+                localCache[id] = parsed; // Salva na memória para a próxima chamada
+                return parsed;
+            }
             return null;
         } catch (e) {
             return null;
         }
     };
+
     const removeData = async (id) => {
         try {
+            delete localCache[id];
             await pool.query('DELETE FROM wa_sessions WHERE id = $1', [id]);
         } catch (e) {}
     };
@@ -91,25 +104,29 @@ async function usePostgresAuthState(pool) {
             keys: {
                 get: async (type, ids) => {
                     const data = {};
-                    await Promise.all(ids.map(async (id) => {
+                    for (const id of ids) {
                         let value = await readData(`${type}-${id}`);
-                        if (type === 'app-state-sync-key' && value) value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                        if (type === 'app-state-sync-key' && value) {
+                            value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                        }
                         data[id] = value;
-                    }));
+                    }
                     return data;
                 },
                 set: async (data) => {
-                    const tasks = [];
+                    // GRAVAÇÃO SEQUENCIAL: Em vez de bombardear o Neon DB de uma vez, faz um por um.
                     for (const category of Object.keys(data)) {
                         for (const id of Object.keys(data[category])) {
                             const value = data[category][id];
                             const key = `${category}-${id}`;
-                            if (value) tasks.push(writeData(value, key));
-                            else tasks.push(removeData(key));
+                            if (value) {
+                                await writeData(value, key);
+                            } else {
+                                await removeData(key);
+                            }
                         }
                     }
-                    await Promise.allSettled(tasks); // Impede que 1 erro quebre tudo
-                },
+                }
             }
         },
         saveCreds: () => writeData(creds, 'creds')
@@ -122,8 +139,8 @@ async function connectToWhatsApp() {
         sock = makeWASocket({ 
             auth: state, 
             printQRInTerminal: true, 
-            logger: pino({ level: 'silent' }),
-            browser: ["Mac OS", "Chrome", "10.15.7"] // Ajuda na estabilidade
+            logger: pino({ level: 'silent' }), // Oculta logs excessivos do Baileys
+            browser: ["Mac OS", "Chrome", "10.15.7"] // Máscara de navegador para estabilidade
         });
 
         sock.ev.on('creds.update', saveCreds);
@@ -131,14 +148,18 @@ async function connectToWhatsApp() {
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
             if (qr) { currentQR = await qrcode.toDataURL(qr); isConnected = false; }
+            
             if (connection === 'close') {
                 isConnected = false; currentQR = '';
-                const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
+                const statusCode = lastDisconnect.error?.output?.statusCode;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
                 
-                console.log('❌ Conexão fechada. Reconectando:', shouldReconnect);
+                console.log('❌ Conexão fechada. Reconectando?', shouldReconnect, '(Código:', statusCode, ')');
+                
                 if (shouldReconnect) {
                     setTimeout(connectToWhatsApp, 3000);
                 } else {
+                    console.log('🚪 Logout detectado. A limpar sessão do banco de dados...');
                     await pool.query('DELETE FROM wa_sessions').catch(()=>{}); 
                     connectToWhatsApp(); 
                 }
@@ -148,6 +169,7 @@ async function connectToWhatsApp() {
             }
         });
 
+        // Atualização de status da mensagem (Entregue/Lida)
         sock.ev.on('messages.update', async (updates) => {
             for (const update of updates) {
                 if (update.update.status) {
@@ -170,7 +192,7 @@ app.get('/api/status', (req, res) => res.json({ isConnected, qr: currentQR }));
 app.post('/api/logout', async (req, res) => {
     try {
         if (sock) await sock.logout();
-        await pool.query('DELETE FROM wa_sessions');
+        await pool.query('DELETE FROM wa_sessions').catch(()=>{});
         isConnected = false;
         currentQR = '';
         res.json({ success: true, message: 'WhatsApp desconectado com sucesso.' });
@@ -191,7 +213,7 @@ app.post('/api/pair', async (req, res) => {
 });
 
 // ==========================================
-// 3. LEITURA DE FICHEIROS
+// 3. LEITURA DE FICHEIROS E VALIDAÇÃO DE NÚMEROS
 // ==========================================
 function extractNumbers(text, file) {
     let numbers = new Set();
@@ -227,7 +249,7 @@ app.post('/api/preview', upload.single('file'), (req, res) => {
 });
 
 // ==========================================
-// 4. ENVIO DE MENSAGENS E LOOP CORRIGIDO
+// 4. ENVIO DE MENSAGENS EM MASSA (LOOP SEGURO EM SEGUNDO PLANO)
 // ==========================================
 app.post('/api/send', uploadFields, async (req, res) => {
     try {
@@ -251,29 +273,30 @@ app.post('/api/send', uploadFields, async (req, res) => {
         const campRes = await pool.query('INSERT INTO campaigns (message) VALUES ($1) RETURNING id', [message]);
         const campaignId = campRes.rows[0].id;
 
-        // Responde ao cliente imediatamente (para o Render não dar Timeout)
-        res.json({ success: true, message: `${numbers.length} mensagens enviadas para processamento em background!`, campaignId });
+        // Responde ao utilizador imediatamente (para evitar Timeouts no Front-end ou Render)
+        res.json({ success: true, message: `${numbers.length} mensagens enviadas para processamento na fila!`, campaignId });
 
-        // LOOP DE ENVIO EM BACKGROUND ISOLADO
+        // INÍCIO DO LOOP DE DISPARO (Roda solto em Background)
         setTimeout(async () => {
-            console.log(`▶ Iniciando disparo para ${numbers.length} contactos...`);
+            console.log(`▶ Iniciando disparo para ${numbers.length} contactos... (Delay: ${delayMs/1000}s)`);
             
             for (const number of numbers) {
                 const jid = `${number}@s.whatsapp.net`;
                 try {
-                    // Try/Catch exclusivo para verificação do número
+                    // Try/Catch exclusivo para verificação se o número tem WhatsApp
                     let exists = null;
                     try {
                         const existsArray = await sock.onWhatsApp(jid);
                         exists = existsArray && existsArray.length > 0 ? existsArray[0] : null;
                     } catch (e) {
-                        console.log(`Aviso ao checar ${number}: O Baileys bloqueou a verificação, ignorando...`);
-                        exists = { exists: true }; // Assume que existe se o Baileys bloquear a query
+                        console.log(`Aviso ao verificar ${number}: Verificação bloqueada pelo Baileys. A forçar envio...`);
+                        exists = { exists: true }; // Se bloquear a pesquisa, força o envio.
                     }
 
                     if (exists && exists.exists) {
                         let sentMsgId;
 
+                        // Se existirem imagens
                         if (imagesBuffer.length > 0) {
                             for (let i = 0; i < imagesBuffer.length; i++) {
                                 const msgOptions = { 
@@ -285,43 +308,47 @@ app.post('/api/send', uploadFields, async (req, res) => {
                                 if (i < imagesBuffer.length - 1) await new Promise(r => setTimeout(r, 1000));
                             }
                         } else {
+                            // Se for apenas texto
                             const m = await sock.sendMessage(jid, { text: message });
                             sentMsgId = m?.key?.id;
                         }
 
-                        // Try/Catch apenas para o Banco de Dados
-                        await pool.query('INSERT INTO messages (campaign_id, phone, status, wa_message_id) VALUES ($1, $2, $3, $4)', [campaignId, number, 'sent', sentMsgId]).catch(err => console.error("Falha DB 1:", err.message));
-                        console.log(`✅ Enviado para: ${number}`);
+                        // Salva o ID da mensagem com ".catch" para evitar que o Neon trave o sistema se houver erro SQL
+                        await pool.query('INSERT INTO messages (campaign_id, phone, status, wa_message_id) VALUES ($1, $2, $3, $4)', [campaignId, number, 'sent', sentMsgId]).catch(err => console.error("Falha DB Sent:", err.message));
+                        console.log(`✅ Entregue na fila: ${number}`);
                         
                     } else {
-                        await pool.query('INSERT INTO messages (campaign_id, phone, status) VALUES ($1, $2, $3)', [campaignId, number, 'failed (Sem WhatsApp)']).catch(err => console.error("Falha DB 2:", err.message));
-                        console.log(`🚫 Não tem WhatsApp: ${number}`);
+                        await pool.query('INSERT INTO messages (campaign_id, phone, status) VALUES ($1, $2, $3)', [campaignId, number, 'failed (Sem WhatsApp)']).catch(err => console.error("Falha DB Sem WA:", err.message));
+                        console.log(`🚫 Número inválido ou sem WA: ${number}`);
                     }
                 } catch (error) {
-                    console.error(`❌ Erro crítico ao enviar para ${number}:`, error.message);
-                    await pool.query('INSERT INTO messages (campaign_id, phone, status) VALUES ($1, $2, $3)', [campaignId, number, 'failed']).catch(err => console.error("Falha DB 3:", err.message));
+                    // Se o disparo daquela mensagem falhar de forma catastrófica, o loop marca como failed e CONTINUA a próxima.
+                    console.error(`❌ Erro crítico ao processar o número ${number}:`, error.message);
+                    await pool.query('INSERT INTO messages (campaign_id, phone, status) VALUES ($1, $2, $3)', [campaignId, number, 'failed']).catch(err => console.error("Falha DB Error:", err.message));
                 }
                 
-                // Pausa rigorosa (Delay)
+                // Pausa rigorosa (Delay definido pelo utilizador na interface)
                 await new Promise(r => setTimeout(r, delayMs));
             }
-            console.log("⏹ Fim da campanha.");
+            console.log("⏹ Fim do processamento da campanha!");
         }, 0);
 
     } catch (err) {
-        console.error(err);
-        if (!res.headersSent) res.status(500).json({ error: 'Erro no servidor.' });
+        console.error("Erro no processamento da chamada API /send:", err);
+        if (!res.headersSent) res.status(500).json({ error: 'Erro no servidor interno.' });
     }
 });
 
+// Histórico de campanhas
 app.get('/api/history', async (req, res) => {
     try {
         const result = await pool.query(`SELECT c.id, c.message, c.created_at, COUNT(m.id) as total, COUNT(m.id) FILTER (WHERE m.status = 'delivered' OR m.status = 'read') as delivered FROM campaigns c LEFT JOIN messages m ON c.id = m.campaign_id GROUP BY c.id ORDER BY c.created_at DESC`);
         res.json(result.rows);
     } catch (e) {
+        console.error("Erro ao buscar histórico:", e.message);
         res.json([]);
     }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Backend rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Backend rodando com sucesso na porta ${PORT}`));
