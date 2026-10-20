@@ -6,14 +6,19 @@ const { Pool } = require('pg');
 const xlsx = require('xlsx');
 const fs = require('fs');
 const qrcode = require('qrcode');
-const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { 
+    makeWASocket, 
+    DisconnectReason, 
+    initAuthCreds, 
+    BufferJSON, 
+    proto 
+} = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Agora aceitamos dois campos de ficheiro: 'file' (contactos) e 'image' (imagem da campanha)
 const upload = multer({ dest: 'uploads/' });
 const uploadFields = upload.fields([{ name: 'file', maxCount: 1 }, { name: 'image', maxCount: 1 }]);
 
@@ -23,8 +28,64 @@ let sock;
 let currentQR = '';      
 let isConnected = false; 
 
+// Base de Dados para Sessão 
+async function usePostgresAuthState(pool) {
+    const writeData = async (data, id) => {
+        const str = JSON.stringify(data, BufferJSON.replacer);
+        await pool.query(
+            `INSERT INTO wa_sessions (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data`,
+            [id, str]
+        );
+    };
+
+    const readData = async (id) => {
+        const res = await pool.query('SELECT data FROM wa_sessions WHERE id = $1', [id]);
+        if (res.rows.length > 0) return JSON.parse(res.rows[0].data, BufferJSON.reviver);
+        return null;
+    };
+
+    const removeData = async (id) => {
+        await pool.query('DELETE FROM wa_sessions WHERE id = $1', [id]);
+    };
+
+    const creds = (await readData('creds')) || initAuthCreds();
+
+    return {
+        state: {
+            creds,
+            keys: {
+                get: async (type, ids) => {
+                    const data = {};
+                    await Promise.all(ids.map(async (id) => {
+                        let value = await readData(`${type}-${id}`);
+                        if (type === 'app-state-sync-key' && value) {
+                            value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                        }
+                        data[id] = value;
+                    }));
+                    return data;
+                },
+                set: async (data) => {
+                    const tasks = [];
+                    for (const category of Object.keys(data)) {
+                        for (const id of Object.keys(data[category])) {
+                            const value = data[category][id];
+                            const key = `${category}-${id}`;
+                            if (value) tasks.push(writeData(value, key));
+                            else tasks.push(removeData(key));
+                        }
+                    }
+                    await Promise.all(tasks);
+                },
+            }
+        },
+        saveCreds: () => writeData(creds, 'creds')
+    };
+}
+
+// Inicializa WhatsApp
 async function connectToWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+    const { state, saveCreds } = await usePostgresAuthState(pool);
     
     sock = makeWASocket({
         auth: state,
@@ -46,10 +107,11 @@ async function connectToWhatsApp() {
             isConnected = false;
             currentQR = '';
             const statusCode = lastDisconnect.error?.output?.statusCode;
+            
             if (statusCode !== DisconnectReason.loggedOut) {
                 connectToWhatsApp();
             } else {
-                fs.rmSync('auth_info_baileys', { recursive: true, force: true });
+                await pool.query('DELETE FROM wa_sessions');
                 connectToWhatsApp();
             }
         } else if (connection === 'open') {
@@ -73,8 +135,38 @@ async function connectToWhatsApp() {
 }
 connectToWhatsApp();
 
+// Endpoint de Status (QR Code)
 app.get('/api/status', (req, res) => {
     res.json({ isConnected, qr: currentQR });
+});
+
+// ----------------------------------------------------
+// NOVO ENDPOINT: GERA CÓDIGO DE PAREAMENTO
+// ----------------------------------------------------
+app.post('/api/pair', async (req, res) => {
+    try {
+        if (isConnected) return res.status(400).json({ error: 'O WhatsApp já está conectado!' });
+        
+        const { phone } = req.body;
+        if (!phone) return res.status(400).json({ error: 'O número de telemóvel é obrigatório.' });
+
+        // Ajuste automático para Moçambique
+        let cleanPhone = String(phone).replace(/\D/g, ''); 
+        if (cleanPhone.length === 9 && cleanPhone.startsWith('8')) {
+            cleanPhone = '258' + cleanPhone;
+        }
+
+        // Pede o código à biblioteca Baileys
+        const code = await sock.requestPairingCode(cleanPhone);
+        
+        // Coloca um traço no meio para facilitar a leitura (Ex: ABCD-1234)
+        const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
+
+        res.json({ success: true, code: formattedCode });
+    } catch (error) {
+        console.error('Erro ao gerar código de pareamento:', error);
+        res.status(500).json({ error: 'Erro ao gerar o código. Verifique o número e tente novamente.' });
+    }
 });
 
 function extractNumbers(text, file) {
@@ -93,20 +185,17 @@ function extractNumbers(text, file) {
             const sheet = workbook.Sheets[workbook.SheetNames[0]];
             const data = xlsx.utils.sheet_to_json(sheet, { header: 1 });
             data.forEach(row => { if (row[0]) processNumber(row[0]); });
-            fs.unlinkSync(file.path); // Apaga ficheiro excel após extrair
+            fs.unlinkSync(file.path); 
         } catch (error) { console.error(error); }
     }
     return Array.from(numbers);
 }
 
-// ROTA DE ENVIO ATUALIZADA (Lida com imagem)
 app.post('/api/send', uploadFields, async (req, res) => {
     try {
         if (!isConnected) return res.status(400).json({ error: 'WhatsApp não está conectado!' });
 
         const { message, manualNumbers } = req.body;
-        
-        // Pega os ficheiros carregados
         const contactsFile = req.files['file'] ? req.files['file'][0] : null;
         const imageFile = req.files['image'] ? req.files['image'][0] : null;
 
@@ -116,11 +205,10 @@ app.post('/api/send', uploadFields, async (req, res) => {
             return res.status(400).json({ error: 'Mensagem inválida ou nenhum número válido detectado.' });
         }
 
-        // Se o utilizador enviou uma imagem, nós lemos a imagem para a memória
         let imageBuffer = null;
         if (imageFile) {
             imageBuffer = fs.readFileSync(imageFile.path);
-            fs.unlinkSync(imageFile.path); // Apaga a imagem do servidor após ler para não encher o disco
+            fs.unlinkSync(imageFile.path);
         }
 
         const campRes = await pool.query('INSERT INTO campaigns (message) VALUES ($1) RETURNING id', [message]);
@@ -128,20 +216,13 @@ app.post('/api/send', uploadFields, async (req, res) => {
 
         res.json({ success: true, message: `${numbers.length} mensagens enviadas para a fila!`, campaignId });
 
-        // Loop de envio
         for (const number of numbers) {
             const jid = `${number}@s.whatsapp.net`;
             try {
                 const [exists] = await sock.onWhatsApp(jid);
                 if (exists) {
-                    
-                    // Se tem imagem, manda a imagem e põe o texto como legenda. Se não, manda só texto.
-                    const msgOptions = imageBuffer 
-                        ? { image: imageBuffer, caption: message } 
-                        : { text: message };
-
+                    const msgOptions = imageBuffer ? { image: imageBuffer, caption: message } : { text: message };
                     const sentMsg = await sock.sendMessage(jid, msgOptions);
-                    
                     await pool.query('INSERT INTO messages (campaign_id, phone, status, wa_message_id) VALUES ($1, $2, $3, $4)', [campaignId, number, 'sent', sentMsg.key.id]);
                 } else {
                     await pool.query('INSERT INTO messages (campaign_id, phone, status) VALUES ($1, $2, $3)', [campaignId, number, 'failed (não tem WA)']);
@@ -149,7 +230,6 @@ app.post('/api/send', uploadFields, async (req, res) => {
             } catch (error) {
                 await pool.query('INSERT INTO messages (campaign_id, phone, status) VALUES ($1, $2, $3)', [campaignId, number, 'failed']);
             }
-            // Delay anti-ban
             await new Promise(r => setTimeout(r, Math.random() * 3000 + 3000));
         }
     } catch (err) {
