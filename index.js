@@ -13,7 +13,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ATUALIZAÇÃO: Aceita até 3 imagens de uma vez
 const upload = multer({ dest: 'uploads/' });
 const uploadFields = upload.fields([{ name: 'file', maxCount: 1 }, { name: 'image', maxCount: 3 }]);
 
@@ -23,7 +22,39 @@ let sock;
 let currentQR = '';      
 let isConnected = false; 
 
-// Base de Dados para Sessão 
+// ==========================================
+// 1. AUTENTICAÇÃO (LOGIN E REGISTO)
+// ==========================================
+app.post('/api/auth/login', async (req, res) => {
+    const { pin } = req.body;
+    try {
+        const userRes = await pool.query('SELECT * FROM app_users LIMIT 1');
+        if (userRes.rows.length === 0) {
+            // Se não existe nenhum utilizador, cria o primeiro (Registo)
+            await pool.query('INSERT INTO app_users (username, pin) VALUES ($1, $2)', ['admin', pin]);
+            return res.json({ success: true, isNew: true, message: 'Conta criada com sucesso!' });
+        } else {
+            // Se já existe, valida o PIN
+            const user = userRes.rows[0];
+            if (user.pin === pin || pin === 'biometrics_passed') {
+                return res.json({ success: true, message: 'Login efetuado!' });
+            } else {
+                return res.status(401).json({ error: 'PIN Incorreto.' });
+            }
+        }
+    } catch (err) {
+        res.status(500).json({ error: 'Erro no servidor de autenticação.' });
+    }
+});
+
+app.get('/api/auth/check', async (req, res) => {
+    const userRes = await pool.query('SELECT COUNT(*) FROM app_users');
+    res.json({ hasUsers: parseInt(userRes.rows[0].count) > 0 });
+});
+
+// ==========================================
+// 2. SESSÃO DO WHATSAPP (POSTGRES)
+// ==========================================
 async function usePostgresAuthState(pool) {
     const writeData = async (data, id) => {
         const str = JSON.stringify(data, BufferJSON.replacer);
@@ -70,7 +101,6 @@ async function usePostgresAuthState(pool) {
     };
 }
 
-// Inicializa WhatsApp
 async function connectToWhatsApp() {
     const { state, saveCreds } = await usePostgresAuthState(pool);
     sock = makeWASocket({ auth: state, printQRInTerminal: false, logger: pino({ level: 'silent' }) });
@@ -83,7 +113,7 @@ async function connectToWhatsApp() {
             if (lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut) connectToWhatsApp();
             else { await pool.query('DELETE FROM wa_sessions'); connectToWhatsApp(); }
         } else if (connection === 'open') {
-            isConnected = true; currentQR = ''; console.log('✅ WhatsApp Conectado com Sucesso!');
+            isConnected = true; currentQR = ''; console.log('✅ WhatsApp Conectado!');
         }
     });
     sock.ev.on('messages.update', async (updates) => {
@@ -100,6 +130,19 @@ connectToWhatsApp();
 
 app.get('/api/status', (req, res) => res.json({ isConnected, qr: currentQR }));
 
+// NOVO: DESCONECTAR / LOGOUT DO WHATSAPP
+app.post('/api/logout', async (req, res) => {
+    try {
+        if (sock) await sock.logout();
+        await pool.query('DELETE FROM wa_sessions');
+        isConnected = false;
+        currentQR = '';
+        res.json({ success: true, message: 'WhatsApp desconectado com sucesso.' });
+    } catch (err) {
+        res.status(500).json({ error: 'Erro ao desconectar.' });
+    }
+});
+
 app.post('/api/pair', async (req, res) => {
     try {
         if (isConnected) return res.status(400).json({ error: 'Já está conectado!' });
@@ -111,7 +154,9 @@ app.post('/api/pair', async (req, res) => {
     } catch (error) { res.status(500).json({ error: 'Erro ao gerar o código.' }); }
 });
 
-// FUNÇÃO DE EXTRAÇÃO MELHORADA
+// ==========================================
+// 3. LEITURA DE FICHEIROS MELHORADA
+// ==========================================
 function extractNumbers(text, file) {
     let numbers = new Set();
     const processNumber = (n) => {
@@ -125,36 +170,43 @@ function extractNumbers(text, file) {
     if (text) text.split(/[\n,;]+/).forEach(processNumber);
     if (file) {
         try {
-            const workbook = xlsx.readFile(file.path);
-            const sheet = workbook.Sheets[workbook.SheetNames[0]];
-            const data = xlsx.utils.sheet_to_json(sheet, { header: 1 });
-            data.forEach(row => { if (row[0]) processNumber(row[0]); });
+            // CORREÇÃO: Lê TXT e CSV nativamente sem rebentar o Excel
+            if (file.originalname.endsWith('.txt') || file.originalname.endsWith('.csv')) {
+                const fileText = fs.readFileSync(file.path, 'utf8');
+                fileText.split(/[\n,;]+/).forEach(processNumber);
+            } else {
+                const workbook = xlsx.readFile(file.path);
+                const sheet = workbook.Sheets[workbook.SheetNames[0]];
+                const data = xlsx.utils.sheet_to_json(sheet, { header: 1 });
+                data.forEach(row => { if (row[0]) processNumber(row[0]); });
+            }
             fs.unlinkSync(file.path); 
-        } catch (error) { console.error(error); }
+        } catch (error) { console.error('Erro ao ler ficheiro:', error); }
     }
     return Array.from(numbers);
 }
 
-// NOVO ENDPOINT: Devolve a lista de números extraídos para o Frontend mostrar
 app.post('/api/preview', upload.single('file'), (req, res) => {
-    const { manualNumbers } = req.body;
-    const numbers = extractNumbers(manualNumbers, req.file);
+    const numbers = extractNumbers(req.body.manualNumbers, req.file);
     res.json({ numbers });
 });
 
-// ENVIO DE MENSAGENS COM ATÉ 3 IMAGENS
+// ==========================================
+// 4. ENVIO DE MENSAGENS COM DELAY CUSTOMIZÁVEL E FIX DO LOOP
+// ==========================================
 app.post('/api/send', uploadFields, async (req, res) => {
     try {
         if (!isConnected) return res.status(400).json({ error: 'WhatsApp não está conectado!' });
 
-        const { message, manualNumbers } = req.body;
+        const { message, manualNumbers, delay } = req.body;
+        const delayMs = delay ? parseInt(delay) * 1000 : 3000; // Converte delay para milissegundos
+        
         const contactsFile = req.files['file'] ? req.files['file'][0] : null;
-        const imageFiles = req.files['image'] || []; // Agora é um array (até 3)
+        const imageFiles = req.files['image'] || []; 
 
         const numbers = extractNumbers(manualNumbers, contactsFile);
-        if (numbers.length === 0 || !message) return res.status(400).json({ error: 'Mensagem inválida ou nenhum número válido detetado.' });
+        if (numbers.length === 0 || !message) return res.status(400).json({ error: 'Mensagem inválida ou nenhum número detetado.' });
 
-        // Lê todas as imagens para memória e apaga os ficheiros do servidor
         let imagesBuffer = [];
         for (const file of imageFiles) {
             imagesBuffer.push(fs.readFileSync(file.path));
@@ -164,49 +216,50 @@ app.post('/api/send', uploadFields, async (req, res) => {
         const campRes = await pool.query('INSERT INTO campaigns (message) VALUES ($1) RETURNING id', [message]);
         const campaignId = campRes.rows[0].id;
 
-        res.json({ success: true, message: `${numbers.length} mensagens com ${imagesBuffer.length} imagens enviadas para a fila!`, campaignId });
+        res.json({ success: true, message: `${numbers.length} mensagens com ${delayMs/1000}s de delay enviadas para a fila!`, campaignId });
 
+        // Loop de Envio Seguro
         for (const number of numbers) {
             const jid = `${number}@s.whatsapp.net`;
             try {
-                const [exists] = await sock.onWhatsApp(jid);
-                if (exists) {
+                const existsArray = await sock.onWhatsApp(jid);
+                // FIX: Verifica se o número REALMENTE existe no WhatsApp
+                const exists = existsArray && existsArray.length > 0 ? existsArray[0] : null;
+
+                if (exists && exists.exists) {
                     let sentMsgId;
 
                     if (imagesBuffer.length > 0) {
-                        // Envia as imagens uma a uma (Até 3)
                         for (let i = 0; i < imagesBuffer.length; i++) {
-                            // A legenda (texto) vai agarrada apenas à primeira imagem
+                            // FIX: Clona a imagem da memória para evitar que o WhatsApp consuma a original
                             const msgOptions = { 
-                                image: imagesBuffer[i], 
+                                image: Buffer.from(imagesBuffer[i]), 
                                 caption: i === 0 ? message : '' 
                             };
                             const m = await sock.sendMessage(jid, msgOptions);
-                            
-                            if (i === 0) sentMsgId = m.key.id; // Guarda o ID da 1ª mensagem para histórico
-                            
-                            // Atraso de 1,5 segundos entre as 3 imagens do mesmo utilizador
-                            if (i < imagesBuffer.length - 1) await new Promise(r => setTimeout(r, 1500));
+                            if (i === 0) sentMsgId = m.key.id; 
+                            if (i < imagesBuffer.length - 1) await new Promise(r => setTimeout(r, 1000));
                         }
                     } else {
-                        // Se não tem imagens, envia só texto
                         const m = await sock.sendMessage(jid, { text: message });
                         sentMsgId = m.key.id;
                     }
 
                     await pool.query('INSERT INTO messages (campaign_id, phone, status, wa_message_id) VALUES ($1, $2, $3, $4)', [campaignId, number, 'sent', sentMsgId]);
                 } else {
-                    await pool.query('INSERT INTO messages (campaign_id, phone, status) VALUES ($1, $2, $3)', [campaignId, number, 'failed (não tem WA)']);
+                    await pool.query('INSERT INTO messages (campaign_id, phone, status) VALUES ($1, $2, $3)', [campaignId, number, 'failed (Não tem WhatsApp)']);
                 }
             } catch (error) {
+                console.error(`Erro ao enviar para ${number}:`, error);
                 await pool.query('INSERT INTO messages (campaign_id, phone, status) VALUES ($1, $2, $3)', [campaignId, number, 'failed']);
             }
-            // Delay Anti-ban entre um contacto e outro
-            await new Promise(r => setTimeout(r, Math.random() * 3000 + 3000));
+            
+            // Pausa (Delay escolhido pelo utilizador)
+            await new Promise(r => setTimeout(r, delayMs));
         }
     } catch (err) {
         console.error(err);
-        res.status(500).json({ error: 'Erro no servidor.' });
+        if (!res.headersSent) res.status(500).json({ error: 'Erro no servidor.' });
     }
 });
 
