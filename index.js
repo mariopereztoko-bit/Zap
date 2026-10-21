@@ -16,6 +16,7 @@ app.use(express.json());
 const upload = multer({ dest: 'uploads/' });
 const uploadFields = upload.fields([{ name: 'file', maxCount: 1 }, { name: 'image', maxCount: 3 }]);
 
+// Conexão com o banco de dados NEON
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 let sock;
@@ -23,14 +24,14 @@ let currentQR = '';
 let isConnected = false; 
 
 // ==========================================
-// 1. SESSÃO DO WHATSAPP COM FILA DE GRAVAÇÃO (RESOLVE DESCONEXÃO NO NEON DB)
+// 1. SESSÃO DO WHATSAPP COM FILA DE GRAVAÇÃO (CACHE HÍBRIDA)
 // ==========================================
 async function usePostgresAuthState(pool) {
     const localCache = {};
     const writeQueue = [];
     let isWriting = false;
 
-    // Fila Indiana para não derrubar o Neon DB
+    // Fila Indiana para não derrubar o limite de conexões do Neon DB
     const processQueue = async () => {
         if (isWriting || writeQueue.length === 0) return;
         isWriting = true;
@@ -111,9 +112,9 @@ async function connectToWhatsApp() {
         sock = makeWASocket({ 
             auth: state, 
             printQRInTerminal: true, 
-            logger: pino({ level: 'silent' }),
+            logger: pino({ level: 'silent' }), // Deixa os logs mais limpos
             browser: ["Mac OS", "Chrome", "10.15.7"],
-            syncFullHistory: false, // Evita puxar mensagens antigas para não estourar o banco
+            syncFullHistory: false, // Evita puxar mensagens velhas para poupar banco de dados
             markOnlineOnConnect: true
         });
 
@@ -133,7 +134,7 @@ async function connectToWhatsApp() {
                 if (shouldReconnect) {
                     setTimeout(connectToWhatsApp, 3000);
                 } else {
-                    console.log('🚪 Logout detectado. A limpar sessão do banco...');
+                    console.log('🚪 Logout detetado. A limpar sessão do banco...');
                     await pool.query('DELETE FROM wa_sessions').catch(()=>{}); 
                     connectToWhatsApp(); 
                 }
@@ -143,6 +144,7 @@ async function connectToWhatsApp() {
             }
         });
 
+        // Atualizar status de "entregue" e "lido" no histórico
         sock.ev.on('messages.update', async (updates) => {
             for (const update of updates) {
                 if (update.update.status) {
@@ -181,7 +183,7 @@ app.post('/api/pair', async (req, res) => {
 });
 
 // ==========================================
-// 2. LEITURA DE FICHEIROS E DISPARO
+// 2. LEITURA DE FICHEIROS E FORMATAÇÃO DE NÚMEROS
 // ==========================================
 function extractNumbers(text, file) {
     let numbers = new Set();
@@ -216,9 +218,14 @@ app.post('/api/preview', upload.single('file'), (req, res) => {
     res.json({ numbers });
 });
 
+// ==========================================
+// 3. MOTOR DE DISPARO (CORRIGIDO PARA O WHATSAPP RECEBER)
+// ==========================================
 app.post('/api/send', uploadFields, async (req, res) => {
     try {
-        if (!isConnected) return res.status(400).json({ error: 'WhatsApp não está conectado!' });
+        if (!isConnected || !sock) {
+            return res.status(400).json({ error: 'O WhatsApp não está conectado!' });
+        }
 
         const { message, manualNumbers, delay } = req.body;
         const delayMs = delay ? parseInt(delay) * 1000 : 3000;
@@ -227,7 +234,9 @@ app.post('/api/send', uploadFields, async (req, res) => {
         const imageFiles = req.files['image'] || []; 
 
         const numbers = extractNumbers(manualNumbers, contactsFile);
-        if (numbers.length === 0 || !message) return res.status(400).json({ error: 'Mensagem inválida ou nenhum número detetado.' });
+        if (numbers.length === 0 || !message) {
+            return res.status(400).json({ error: 'Mensagem inválida ou nenhum número válido detetado.' });
+        }
 
         let imagesBuffer = [];
         for (const file of imageFiles) {
@@ -235,57 +244,88 @@ app.post('/api/send', uploadFields, async (req, res) => {
             fs.unlinkSync(file.path);
         }
 
+        // Criar campanha no banco de dados
         const campRes = await pool.query('INSERT INTO campaigns (message) VALUES ($1) RETURNING id', [message]);
         const campaignId = campRes.rows[0].id;
 
+        // Avisa o Frontend imediatamente
         res.json({ success: true, message: `${numbers.length} mensagens enviadas para processamento!`, campaignId });
 
+        // LOOP DE ENVIO (Fila a rodar em Background)
         setTimeout(async () => {
-            console.log(`▶ Iniciando disparo...`);
+            console.log(`\n🚀 INICIANDO DISPARO: ${numbers.length} contactos (Delay: ${delayMs/1000}s)`);
+            
             for (const number of numbers) {
-                const jid = `${number}@s.whatsapp.net`;
                 try {
-                    let exists = null;
-                    try {
-                        const existsArray = await sock.onWhatsApp(jid);
-                        exists = existsArray && existsArray.length > 0 ? existsArray[0] : null;
-                    } catch (e) { exists = { exists: true }; }
+                    console.log(`\n🔎 A verificar número: ${number}...`);
+                    
+                    // CORREÇÃO: Passar APENAS os números (sem @s.whatsapp.net) para a verificação nativa
+                    const existsArray = await sock.onWhatsApp(number);
+                    const exists = existsArray && existsArray.length > 0 ? existsArray[0] : null;
 
                     if (exists && exists.exists) {
+                        // O WhatsApp devolve o "JID" oficial que devemos usar para enviar a mensagem
+                        const jid = exists.jid;
                         let sentMsgId;
+
+                        console.log(`✅ Número válido! A enviar mensagem para: ${jid}`);
+
+                        // Se existirem imagens
                         if (imagesBuffer.length > 0) {
                             for (let i = 0; i < imagesBuffer.length; i++) {
-                                const msgOptions = { image: Buffer.from(imagesBuffer[i]), caption: i === 0 ? message : '' };
+                                const msgOptions = { 
+                                    image: imagesBuffer[i], 
+                                    caption: i === 0 ? message : '' 
+                                };
                                 const m = await sock.sendMessage(jid, msgOptions);
                                 if (i === 0) sentMsgId = m?.key?.id; 
-                                if (i < imagesBuffer.length - 1) await new Promise(r => setTimeout(r, 1000));
+                                
+                                if (i < imagesBuffer.length - 1) {
+                                    await new Promise(r => setTimeout(r, 1000)); // Pausa entre fotos
+                                }
                             }
                         } else {
+                            // Enviar Apenas Texto
                             const m = await sock.sendMessage(jid, { text: message });
                             sentMsgId = m?.key?.id;
                         }
+
+                        // Registar no DB como Enviada
                         await pool.query('INSERT INTO messages (campaign_id, phone, status, wa_message_id) VALUES ($1, $2, $3, $4)', [campaignId, number, 'sent', sentMsgId]).catch(()=>{});
+                        console.log(`📨 Mensagem ENTREGUE com sucesso para ${number}`);
+                        
                     } else {
                         await pool.query('INSERT INTO messages (campaign_id, phone, status) VALUES ($1, $2, $3)', [campaignId, number, 'failed (Sem WA)']).catch(()=>{});
+                        console.log(`🚫 Falha: O número ${number} não tem WhatsApp ativo.`);
                     }
                 } catch (error) {
+                    console.error(`❌ Erro CRÍTICO ao enviar para ${number}:`, error.message);
                     await pool.query('INSERT INTO messages (campaign_id, phone, status) VALUES ($1, $2, $3)', [campaignId, number, 'failed']).catch(()=>{});
                 }
+                
+                // Pausa definida pelo utilizador
                 await new Promise(r => setTimeout(r, delayMs));
             }
+            console.log("\n🏁 CAMPANHA CONCLUÍDA!\n");
         }, 0);
 
     } catch (err) {
-        if (!res.headersSent) res.status(500).json({ error: 'Erro no servidor.' });
+        console.error("Erro interno no /send:", err);
+        if (!res.headersSent) res.status(500).json({ error: 'Erro crítico no servidor.' });
     }
 });
 
+// ==========================================
+// 4. VER HISTÓRICO DAS CAMPANHAS
+// ==========================================
 app.get('/api/history', async (req, res) => {
     try {
         const result = await pool.query(`SELECT c.id, c.message, c.created_at, COUNT(m.id) as total, COUNT(m.id) FILTER (WHERE m.status = 'delivered' OR m.status = 'read') as delivered FROM campaigns c LEFT JOIN messages m ON c.id = m.campaign_id GROUP BY c.id ORDER BY c.created_at DESC`);
         res.json(result.rows);
-    } catch (e) { res.json([]); }
+    } catch (e) { 
+        res.json([]); 
+    }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Backend rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Backend a correr na porta ${PORT}`));
